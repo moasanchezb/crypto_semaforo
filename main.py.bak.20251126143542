@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+main.py - pipeline completo: fetch binance klines -> resample -> indicators -> signals -> backtest -> outputs
+Diseñado para correr localmente y sin dependencias pesadas.
+"""
+
+import os
+import json
+import time
+import logging
+from datetime import datetime, timezone
+from typing import List, Dict, Any
+
+import requests
+import pandas as pd
+import numpy as np
+
+# ---------- Util / Logging ----------
+def setup_logging(log_file: str):
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    console.setFormatter(formatter)
+    logging.getLogger().addHandler(console)
+
+def now_ts():
+    return datetime.now(timezone.utc).astimezone().isoformat()
+
+# ---------- Config ----------
+with open("config.json", "r") as f:
+    CFG = json.load(f)
+
+DATA_FOLDER = CFG.get("data_folder", "data")
+OUT_FOLDER = CFG.get("output_folder", "outputs")
+os.makedirs(DATA_FOLDER, exist_ok=True)
+os.makedirs(OUT_FOLDER, exist_ok=True)
+os.makedirs(os.path.dirname(CFG.get("log_file", "logs/app.log")), exist_ok=True)
+
+setup_logging(CFG.get("log_file", "logs/app.log"))
+
+SYMBOL = CFG["symbol"]
+INTERVAL = CFG["interval_raw"]
+LIMIT = int(CFG.get("limit_raw", 500))
+ENDPOINTS = CFG.get("endpoints", ["https://api.binance.com"])
+
+# ---------- Fetch klines with rotation ----------
+def fetch_klines_binance(symbol: str, interval: str, limit: int = 500, endpoints: List[str]=None, retries: int=2) -> pd.DataFrame:
+    endpoints = endpoints or ENDPOINTS
+    last_err = None
+    for base in endpoints:
+        url = f"{base}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        for attempt in range(retries):
+            try:
+                logging.info(f"Fetching {symbol} {interval} from {base} attempt {attempt+1}")
+                r = requests.get(url, timeout=10, headers={"User-Agent":"python-requests/semáforo"})
+                if r.status_code == 200:
+                    data = r.json()
+                    if not isinstance(data, list) or len(data)==0:
+                        last_err = f"Unexpected structure from {base}"
+                        logging.warning(last_err)
+                        break
+                    df = pd.DataFrame(data, columns=[
+                        "openTime","open","high","low","close","volume","closeTime",
+                        "quoteAssetVolume","trades","takerBaseVol","takerQuoteVol","ignore"
+                    ])
+                    # convert types
+                    df["ts"] = pd.to_datetime(df["openTime"], unit="ms")
+                    for col in ["open","high","low","close","volume","quoteAssetVolume"]:
+                        df[col] = pd.to_numeric(df[col], errors="coerce")
+                    df = df[["ts","open","high","low","close","volume","closeTime","quoteAssetVolume","trades"]]
+                    logging.info(f"Fetched {len(df)} klines from {base}")
+                    return df
+                else:
+                    last_err = f"{base} returned {r.status_code}"
+                    logging.warning(last_err + f" body={r.text[:200]}")
+                    # if rate limited or forbidden, try next endpoint
+                    time.sleep(0.6 + attempt*0.8)
+                    continue
+            except Exception as e:
+                last_err = str(e)
+                logging.exception(f"Error fetching from {base}: {e}")
+                time.sleep(0.6 + attempt*0.8)
+    raise RuntimeError(f"All endpoints failed. LastErr: {last_err}")
+
+# ---------- Resample helper ----------
+def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    df = df.set_index("ts").sort_index()
+    o = df["open"].resample(rule).first()
+    h = df["high"].resample(rule).max()
+    l = df["low"].resample(rule).min()
+    c = df["close"].resample(rule).last()
+    v = df["volume"].resample(rule).sum()
+    out = pd.concat([o,h,l,c,v], axis=1)
+    out.columns = ["open","high","low","close","volume"]
+    out = out.dropna().reset_index()
+    return out
+
+# ---------- Indicators ----------
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+def true_range(df: pd.DataFrame) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - prev_close).abs()
+    tr3 = (df["low"] - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr
+
+def atr(df: pd.DataFrame, period: int) -> pd.Series:
+    tr = true_range(df)
+    return tr.rolling(window=period, min_periods=1).mean()
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.rolling(period, min_periods=1).mean()
+    ma_down = down.rolling(period, min_periods=1).mean()
+    rs = ma_up / (ma_down.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+# ---------- z-score spread ----------
+def zscore_spread(df: pd.DataFrame, ema_span: int, window: int):
+    spread = df["close"] - ema(df["close"], span=ema_span)
+    mu = spread.rolling(window).mean()
+    sigma = spread.rolling(window).std().replace(0, np.nan)
+    z = (spread - mu) / sigma
+    return z.fillna(0)
+
+# ---------- Signals logic (mixto) ----------
+def generate_signals(df_ltf: pd.DataFrame, df_htf: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
+    # df_ltf: 15m dataframe with indicators columns
+    # df_htf: 1h dataframe for trend (ema50/200)
+    df = df_ltf.copy().set_index("ts")
+    htf = df_htf.set_index("ts")
+    # trend at each LTF timestamp: use last HTF ema50/200
+    htf["trend"] = np.where(ema(htf["close"], cfg["ema_fast"]) > ema(htf["close"], cfg["ema_slow"]), 1, -1)
+    # forward fill trend to ltf index
+    trend_series = htf["trend"].reindex(df.index, method="ffill").fillna(0)
+    df["trend"] = trend_series
+
+    # signals:
+    # mean reversion entry: z < -z_entry when trend==1 (buy)
+    z = zscore_spread(df.reset_index(), cfg["ema_fast"], cfg["z_window"]).values
+    df["z"] = z
+    df["vol_rel"] = df["volume"] / (df["volume"].rolling(cfg["vol_rel_window"], min_periods=1).mean().replace(0, np.nan))
+    df["atr"] = atr(df.reset_index(), cfg["atr_period"]).values
+
+    buy_mask = (
+        (df["trend"] == 1) &
+        (df["z"] < -cfg["z_entry"]) &
+        (df["vol_rel"] > 0.3)  # lo hacemos permisivo en volumen; ajustable
+    )
+    # breakout/momentum: close > rolling high 20 & vol_rel > threshold
+    df["rolling_high20"] = df["high"].rolling(20, min_periods=1).max()
+    momentum_mask = (df["close"] > df["rolling_high20"]) & (df["vol_rel"] > cfg.get("vol_rel_threshold", 1.3))
+
+    df["signal"] = "HOLD"
+    df.loc[buy_mask | momentum_mask, "signal"] = "BUY"
+    # exit: z >= z_exit or close above take profit or trend flip
+    df.loc[df["z"] >= cfg["z_exit"], "signal"] = "SELL"
+    # mark momentum sells separately when needed
+    df = df.reset_index()
+    return df
+
+# ---------- Simple position sizing & backtest ----------
+def simple_backtest(signals_df: pd.DataFrame, cfg: Dict[str, Any]):
+    balance = float(cfg.get("starting_balance", 100.0))
+    fee = float(cfg.get("fee_rate", 0.0006))
+    slippage = float(cfg.get("slippage", 0.0002))
+    risk_per_trade = float(cfg.get("risk_per_trade", 0.005))
+
+    trades = []
+    position = 0.0
+    entry_price = None
+    entry_index = None
+
+    for i, row in signals_df.iterrows():
+        sig = row["signal"]
+        price = row["close"]
+        atr_val = row.get("atr", np.nan)
+        if sig == "BUY" and position == 0:
+            # approximate stop distance = atr_mult_stop * atr
+            stop_dist = cfg["atr_mult_stop"] * atr_val if not np.isnan(atr_val) else 0.01*price
+            # risk_capital
+            risk_cap = balance * risk_per_trade
+            # position size in USD = risk_cap * (stop_dist_in_price / price)^-1, but simpler:
+            qty_usd = max(1.0, risk_cap * (1/ (stop_dist/price + 1e-9)))
+            # cap by balance
+            qty_usd = min(qty_usd, balance)
+            qty = qty_usd / price
+            position = qty
+            entry_price = price * (1 + slippage)
+            entry_index = i
+            trades.append({
+                "entry_time": row["ts"],
+                "entry_price": entry_price,
+                "qty": qty,
+                "exit_time": None,
+                "exit_price": None,
+                "ret": None
+            })
+        elif sig == "SELL" and position > 0:
+            exit_price = price * (1 - slippage)
+            trades[-1]["exit_time"] = row["ts"]
+            trades[-1]["exit_price"] = exit_price
+            gross = (exit_price - trades[-1]["entry_price"]) * trades[-1]["qty"]
+            fees = (trades[-1]["entry_price"] * trades[-1]["qty"] + exit_price * trades[-1]["qty"]) * fee
+            net = gross - fees
+            ret_pct = net / balance
+            trades[-1]["ret"] = net
+            trades[-1]["ret_pct"] = ret_pct
+            balance += net
+            # clear
+            position = 0.0
+            entry_price = None
+            entry_index = None
+    # compute metrics
+    trades_df = pd.DataFrame(trades)
+    if not trades_df.empty:
+        wins = trades_df[trades_df["ret"] > 0]
+        win_rate = len(wins) / len(trades_df)
+        avg_ret = trades_df["ret"].mean()
+        total = trades_df["ret"].sum()
+    else:
+        win_rate = 0.0
+        avg_ret = 0.0
+        total = 0.0
+    metrics = {
+        "n_trades": len(trades_df),
+        "win_rate": win_rate,
+        "avg_ret": avg_ret,
+        "pnl": total,
+        "final_balance": balance
+    }
+    return trades_df, metrics
+
+# ---------- Run pipeline ----------
+def run_once():
+    try:
+        logging.info("Start pipeline")
+        raw = fetch_klines_binance(SYMBOL, INTERVAL, LIMIT, ENDPOINTS, CFG.get("fetch_retries", 2))
+        raw.to_csv(os.path.join(DATA_FOLDER, "raw_1m.csv"), index=False)
+        logging.info("Saved raw_1m.csv")
+
+        # resample
+        res15 = resample_ohlcv(raw, CFG["resample_1"])
+        res15.to_csv(os.path.join(DATA_FOLDER, "resampled_15m.csv"), index=False)
+        logging.info("Saved resampled_15m.csv")
+
+        res1h = resample_ohlcv(raw, CFG["resample_2"])
+        res1h.to_csv(os.path.join(DATA_FOLDER, "resampled_1h.csv"), index=False)
+        logging.info("Saved resampled_1h.csv")
+
+        # indicators
+        # add ema50 to ltf (as used in zscore), atr, rsi
+        res15["ema50"] = ema(res15["close"], CFG["ema_fast"])
+        res15["atr"] = atr(res15, CFG["atr_period"])
+        res15["rsi"] = rsi(res15["close"], 14)
+        # HTF ema used for trend
+        res1h["ema50"] = ema(res1h["close"], CFG["ema_fast"])
+        res1h["ema200"] = ema(res1h["close"], CFG["ema_slow"])
+
+        # signals
+        signals = generate_signals(res15, res1h, CFG)
+        signals.to_csv(os.path.join(OUT_FOLDER, "signals_15m.csv"), index=False)
+        logging.info("Saved signals_15m.csv")
+
+        # backtest
+        trades_df, metrics = simple_backtest(signals, CFG)
+        trades_df.to_csv(os.path.join(OUT_FOLDER, "backtest.csv"), index=False)
+        logging.info("Saved backtest.csv")
+        logging.info("Metrics: %s", metrics)
+        print("Run finished. Metrics:", metrics)
+
+    except Exception as e:
+        logging.exception("Pipeline failed: %s", e)
+        raise
+
+if __name__ == "__main__":
+    run_once()
+
