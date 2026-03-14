@@ -61,10 +61,7 @@ SCORE_THRESH_LONG = 0.6
 SCORE_THRESH_SHORT = -0.6
 
 ENDPOINTS = [
-    "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
+    "https://data-api.binance.vision"
 ]
 
 os.makedirs("outputs", exist_ok=True)
